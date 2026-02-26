@@ -19,9 +19,11 @@ struct RenderState {
     list_stack: Vec<ListContext>,
     link_url: Option<String>,
     table_row: Vec<String>,
+    table_cell_buf: String,
     table_alignments: Vec<pulldown_cmark::Alignment>,
     table_rows: Vec<Vec<String>>,
     in_table_head: bool,
+    in_table_cell: bool,
 }
 
 #[derive(Clone)]
@@ -47,9 +49,11 @@ impl RenderState {
             list_stack: Vec::new(),
             link_url: None,
             table_row: Vec::new(),
+            table_cell_buf: String::new(),
             table_alignments: Vec::new(),
             table_rows: Vec::new(),
             in_table_head: false,
+            in_table_cell: false,
         }
     }
 
@@ -330,7 +334,10 @@ fn handle_start_tag(state: &mut RenderState, tag: &Tag) {
         Tag::TableRow => {
             state.table_row.clear();
         }
-        Tag::TableCell => {}
+        Tag::TableCell => {
+            state.in_table_cell = true;
+            state.table_cell_buf.clear();
+        }
         _ => {}
     }
 }
@@ -392,7 +399,10 @@ fn handle_end_tag(state: &mut RenderState, tag: &TagEnd) {
         TagEnd::TableRow => {
             state.table_rows.push(state.table_row.clone());
         }
-        TagEnd::TableCell => {}
+        TagEnd::TableCell => {
+            state.table_row.push(std::mem::take(&mut state.table_cell_buf));
+            state.in_table_cell = false;
+        }
         _ => {}
     }
 }
@@ -410,8 +420,8 @@ fn handle_text(state: &mut RenderState, text: &str) {
         return;
     }
 
-    if !state.table_alignments.is_empty() {
-        state.table_row.push(text.to_string());
+    if state.in_table_cell {
+        state.table_cell_buf.push_str(text);
         return;
     }
 
@@ -422,6 +432,10 @@ fn handle_text(state: &mut RenderState, text: &str) {
 }
 
 fn handle_code(state: &mut RenderState, code: &str) {
+    if state.in_table_cell {
+        state.table_cell_buf.push_str(code);
+        return;
+    }
     let styled = if state.use_color {
         format!("{} {} {}", style::BG_GREY, code, style::RESET)
     } else {
