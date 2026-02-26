@@ -24,6 +24,26 @@ cargo build --release
 ./target/release/markterm README.md
 ```
 
+### macOS PATH Setup
+
+After installing with `cargo install`, the binary is placed in `~/.cargo/bin/`. If `markterm` isn't found, add Cargo's bin directory to your PATH:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+To make it permanent, add it to your shell profile:
+
+```bash
+# For zsh (default on macOS)
+echo 'source "$HOME/.cargo/env"' >> ~/.zshrc
+
+# For bash
+echo 'source "$HOME/.cargo/env"' >> ~/.bash_profile
+```
+
+Then restart your terminal or run `source ~/.zshrc`.
+
 ## Usage
 
 ```
