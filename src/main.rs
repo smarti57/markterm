@@ -1,6 +1,7 @@
 mod pager;
 mod parser;
 mod renderer;
+#[allow(dead_code)]
 mod style;
 mod terminal;
 
