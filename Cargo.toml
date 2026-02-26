@@ -1,0 +1,16 @@
+[package]
+name = "markterm"
+version = "0.1.0"
+edition = "2021"
+description = "A markdown viewer for the terminal with built-in paging"
+license = "MIT"
+
+[dependencies]
+pulldown-cmark = "0.12"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

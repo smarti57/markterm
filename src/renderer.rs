@@ -1,0 +1,598 @@
+/// Converts pulldown-cmark events into ANSI-styled, word-wrapped terminal lines.
+
+use pulldown_cmark::{Event, Tag, TagEnd, CodeBlockKind};
+
+use crate::style;
+
+struct RenderState {
+    use_color: bool,
+    width: usize,
+    lines: Vec<String>,
+    current_line: String,
+    indent: usize,
+    bold: bool,
+    italic: bool,
+    strikethrough: bool,
+    in_code_block: bool,
+    in_blockquote: bool,
+    in_heading: Option<u8>,
+    list_stack: Vec<ListContext>,
+    link_url: Option<String>,
+    table_row: Vec<String>,
+    table_alignments: Vec<pulldown_cmark::Alignment>,
+    table_rows: Vec<Vec<String>>,
+    in_table_head: bool,
+}
+
+#[derive(Clone)]
+enum ListContext {
+    Unordered(usize),  // depth
+    Ordered(u64), // current number
+}
+
+impl RenderState {
+    fn new(width: u16, use_color: bool) -> Self {
+        Self {
+            use_color,
+            width: width.saturating_sub(2) as usize, // margin
+            lines: Vec::new(),
+            current_line: String::new(),
+            indent: 0,
+            bold: false,
+            italic: false,
+            strikethrough: false,
+            in_code_block: false,
+            in_blockquote: false,
+            in_heading: None,
+            list_stack: Vec::new(),
+            link_url: None,
+            table_row: Vec::new(),
+            table_alignments: Vec::new(),
+            table_rows: Vec::new(),
+            in_table_head: false,
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        self.lines.push(line.to_string());
+    }
+
+    fn push_blank(&mut self) {
+        // Flush any pending content first
+        self.flush_wrapped();
+        if self.lines.last().map_or(true, |l| !l.is_empty()) {
+            self.lines.push(String::new());
+        }
+    }
+
+    /// Flush `current_line` with word wrapping applied.
+    fn flush_wrapped(&mut self) {
+        if self.current_line.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.current_line);
+        let prefix = self.indent_prefix();
+        let prefix_visible_len = style::visible_len(&prefix);
+        let available = self.width.saturating_sub(prefix_visible_len);
+
+        if available == 0 {
+            self.lines.push(format!("{}{}", prefix, text));
+            return;
+        }
+
+        // Split the accumulated styled text into word-sized chunks.
+        // We need to track visible width while preserving ANSI codes.
+        let segments = split_styled_words(&text);
+
+        let mut line_buf = prefix.clone();
+        let mut line_visible = 0usize;
+
+        for seg in &segments {
+            let seg_visible = style::visible_len(seg);
+
+            if line_visible == 0 {
+                // First word on this line
+                line_buf.push_str(seg);
+                line_visible = seg_visible;
+            } else if line_visible + 1 + seg_visible <= available {
+                // Fits with a space
+                line_buf.push(' ');
+                line_buf.push_str(seg);
+                line_visible += 1 + seg_visible;
+            } else {
+                // Wrap to next line
+                self.lines.push(line_buf);
+                line_buf = format!("{}{}", prefix, seg);
+                line_visible = seg_visible;
+            }
+        }
+
+        if line_visible > 0 || !line_buf.is_empty() {
+            self.lines.push(line_buf);
+        }
+    }
+
+    fn current_style_prefix(&self) -> String {
+        if !self.use_color {
+            return String::new();
+        }
+        let mut codes = Vec::new();
+        if let Some(level) = self.in_heading {
+            match level {
+                1 => {
+                    codes.push(style::BOLD);
+                    codes.push(style::UNDERLINE);
+                    codes.push(style::FG_BRIGHT_WHITE);
+                }
+                2 => {
+                    codes.push(style::BOLD);
+                    codes.push(style::FG_BRIGHT_CYAN);
+                }
+                3 => {
+                    codes.push(style::BOLD);
+                    codes.push(style::FG_BRIGHT_YELLOW);
+                }
+                _ => {
+                    codes.push(style::BOLD);
+                }
+            }
+        }
+        if self.bold {
+            codes.push(style::BOLD);
+        }
+        if self.italic {
+            codes.push(style::ITALIC);
+        }
+        if self.strikethrough {
+            codes.push(style::STRIKETHROUGH);
+        }
+        style::combine(&codes)
+    }
+
+    fn current_style_suffix(&self) -> String {
+        if !self.use_color {
+            String::new()
+        } else if self.bold || self.italic || self.strikethrough || self.in_heading.is_some() {
+            style::RESET.to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    fn indent_prefix(&self) -> String {
+        let mut prefix = String::new();
+        if self.in_blockquote {
+            if self.use_color {
+                prefix.push_str(&format!("{}  │ {}", style::DIM, style::RESET));
+            } else {
+                prefix.push_str("  | ");
+            }
+        }
+        if self.indent > 0 {
+            prefix.push_str(&" ".repeat(self.indent));
+        }
+        prefix
+    }
+}
+
+/// Split a string (potentially containing ANSI codes) into whitespace-delimited segments,
+/// preserving ANSI codes attached to the words they surround.
+fn split_styled_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_escape = false;
+    let mut has_visible = false;
+
+    for ch in text.chars() {
+        if in_escape {
+            current.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            current.push(ch);
+        } else if ch == ' ' || ch == '\t' {
+            if has_visible {
+                words.push(std::mem::take(&mut current));
+                has_visible = false;
+            }
+            // Discard whitespace between words (we'll re-add spaces during wrapping)
+        } else {
+            current.push(ch);
+            has_visible = true;
+        }
+    }
+
+    if !current.is_empty() {
+        words.push(current);
+    }
+
+    words
+}
+
+/// Render a stream of markdown events into styled terminal lines.
+pub fn render(events: Vec<Event<'_>>, width: u16, use_color: bool) -> Vec<String> {
+    let mut state = RenderState::new(width, use_color);
+
+    for event in events {
+        match event {
+            Event::Start(tag) => handle_start_tag(&mut state, &tag),
+            Event::End(tag) => handle_end_tag(&mut state, &tag),
+            Event::Text(text) => handle_text(&mut state, &text),
+            Event::Code(code) => handle_code(&mut state, &code),
+            Event::SoftBreak => handle_soft_break(&mut state),
+            Event::HardBreak => handle_hard_break(&mut state),
+            Event::Rule => handle_rule(&mut state),
+            Event::TaskListMarker(checked) => handle_task_marker(&mut state, checked),
+            _ => {}
+        }
+    }
+
+    state.flush_wrapped();
+    state.lines
+}
+
+fn handle_start_tag(state: &mut RenderState, tag: &Tag) {
+    match tag {
+        Tag::Heading { level, .. } => {
+            state.push_blank();
+            state.in_heading = Some(*level as u8);
+        }
+        Tag::Paragraph => {
+            if !state.in_code_block {
+                state.push_blank();
+            }
+        }
+        Tag::BlockQuote(_) => {
+            state.in_blockquote = true;
+            state.push_blank();
+        }
+        Tag::CodeBlock(kind) => {
+            state.in_code_block = true;
+            state.push_blank();
+            if let CodeBlockKind::Fenced(lang) = kind {
+                if !lang.is_empty() {
+                    let label = style::styled(
+                        &format!("  ╭─ {} ", lang),
+                        &[style::DIM],
+                        state.use_color,
+                    );
+                    state.push_line(&label);
+                } else {
+                    let label = style::styled("  ╭───", &[style::DIM], state.use_color);
+                    state.push_line(&label);
+                }
+            } else {
+                let label = style::styled("  ╭───", &[style::DIM], state.use_color);
+                state.push_line(&label);
+            }
+        }
+        Tag::List(first) => {
+            if state.list_stack.is_empty() {
+                state.push_blank();
+            }
+            let depth = state.list_stack.len();
+            match first {
+                Some(start) => state.list_stack.push(ListContext::Ordered(*start)),
+                None => state.list_stack.push(ListContext::Unordered(depth)),
+            }
+            state.indent = (depth + 1) * 2;
+        }
+        Tag::Item => {
+            state.flush_wrapped();
+            let prefix = state.indent_prefix();
+            let marker = match state.list_stack.last() {
+                Some(ListContext::Unordered(depth)) => {
+                    match depth {
+                        0 => "• ".to_string(),
+                        1 => "◦ ".to_string(),
+                        _ => "▪ ".to_string(),
+                    }
+                }
+                Some(ListContext::Ordered(num)) => {
+                    let s = format!("{}. ", num);
+                    if let Some(ListContext::Ordered(n)) = state.list_stack.last_mut() {
+                        *n += 1;
+                    }
+                    s
+                }
+                None => "• ".to_string(),
+            };
+            let styled_marker = if state.use_color {
+                style::styled(&marker, &[style::FG_CYAN], state.use_color)
+            } else {
+                marker
+            };
+            state.current_line = format!("{}{}", prefix, styled_marker);
+        }
+        Tag::Emphasis => {
+            state.italic = true;
+        }
+        Tag::Strong => {
+            state.bold = true;
+        }
+        Tag::Strikethrough => {
+            state.strikethrough = true;
+        }
+        Tag::Link { dest_url, .. } => {
+            state.link_url = Some(dest_url.to_string());
+        }
+        Tag::Table(alignments) => {
+            state.push_blank();
+            state.table_alignments = alignments.clone();
+            state.table_rows.clear();
+        }
+        Tag::TableHead => {
+            state.in_table_head = true;
+            state.table_row.clear();
+        }
+        Tag::TableRow => {
+            state.table_row.clear();
+        }
+        Tag::TableCell => {}
+        _ => {}
+    }
+}
+
+fn handle_end_tag(state: &mut RenderState, tag: &TagEnd) {
+    match tag {
+        TagEnd::Heading(_level) => {
+            state.flush_wrapped();
+            state.in_heading = None;
+        }
+        TagEnd::Paragraph => {
+            state.flush_wrapped();
+        }
+        TagEnd::BlockQuote(_) => {
+            state.flush_wrapped();
+            state.in_blockquote = false;
+        }
+        TagEnd::CodeBlock => {
+            let label = style::styled("  ╰───", &[style::DIM], state.use_color);
+            state.push_line(&label);
+            state.in_code_block = false;
+        }
+        TagEnd::List(_) => {
+            state.list_stack.pop();
+            state.indent = state.list_stack.len() * 2;
+            if state.list_stack.is_empty() {
+                state.push_blank();
+            }
+        }
+        TagEnd::Item => {
+            state.flush_wrapped();
+        }
+        TagEnd::Emphasis => {
+            state.italic = false;
+        }
+        TagEnd::Strong => {
+            state.bold = false;
+        }
+        TagEnd::Strikethrough => {
+            state.strikethrough = false;
+        }
+        TagEnd::Link => {
+            if let Some(url) = state.link_url.take() {
+                let url_display = style::styled(
+                    &format!(" ({})", url),
+                    &[style::DIM],
+                    state.use_color,
+                );
+                state.current_line.push_str(&url_display);
+            }
+        }
+        TagEnd::Table => {
+            render_table(state);
+        }
+        TagEnd::TableHead => {
+            state.in_table_head = false;
+            state.table_rows.push(state.table_row.clone());
+        }
+        TagEnd::TableRow => {
+            state.table_rows.push(state.table_row.clone());
+        }
+        TagEnd::TableCell => {}
+        _ => {}
+    }
+}
+
+fn handle_text(state: &mut RenderState, text: &str) {
+    if state.in_code_block {
+        for line in text.split('\n') {
+            let formatted = if state.use_color {
+                format!("{}  │ {}{}", style::DIM, style::RESET, line)
+            } else {
+                format!("  | {}", line)
+            };
+            state.push_line(&formatted);
+        }
+        return;
+    }
+
+    if !state.table_alignments.is_empty() {
+        state.table_row.push(text.to_string());
+        return;
+    }
+
+    // Accumulate styled text into current_line. Word wrapping happens at flush.
+    let style_pre = state.current_style_prefix();
+    let style_suf = state.current_style_suffix();
+    state.current_line.push_str(&format!("{}{}{}", style_pre, text, style_suf));
+}
+
+fn handle_code(state: &mut RenderState, code: &str) {
+    let styled = if state.use_color {
+        format!("{} {} {}", style::BG_GREY, code, style::RESET)
+    } else {
+        format!("`{}`", code)
+    };
+    state.current_line.push_str(&styled);
+}
+
+fn handle_soft_break(state: &mut RenderState) {
+    if !state.in_code_block {
+        state.current_line.push(' ');
+    }
+}
+
+fn handle_hard_break(state: &mut RenderState) {
+    state.flush_wrapped();
+}
+
+fn handle_rule(state: &mut RenderState) {
+    state.push_blank();
+    let rule: String = "─".repeat(state.width);
+    let styled_rule = style::styled(&rule, &[style::DIM], state.use_color);
+    state.push_line(&styled_rule);
+    state.push_blank();
+}
+
+fn handle_task_marker(state: &mut RenderState, checked: bool) {
+    let marker = if checked {
+        style::styled("[✓]", &[style::FG_GREEN, style::BOLD], state.use_color)
+    } else {
+        style::styled("[ ]", &[style::DIM], state.use_color)
+    };
+    state.current_line.push_str(&format!("{} ", marker));
+}
+
+fn render_table(state: &mut RenderState) {
+    if state.table_rows.is_empty() {
+        return;
+    }
+
+    let num_cols = state.table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    let mut col_widths = vec![0usize; num_cols];
+    for row in &state.table_rows {
+        for (i, cell) in row.iter().enumerate() {
+            if i < num_cols {
+                col_widths[i] = col_widths[i].max(cell.len());
+            }
+        }
+    }
+
+    for w in &mut col_widths {
+        *w = (*w).max(3);
+    }
+
+    let draw_separator = |state: &mut RenderState, left: &str, mid: &str, right: &str, fill: &str| {
+        let mut line = format!("  {}", left);
+        for (i, w) in col_widths.iter().enumerate() {
+            line.push_str(&fill.repeat(*w + 2));
+            if i < num_cols - 1 {
+                line.push_str(mid);
+            }
+        }
+        line.push_str(right);
+        state.push_line(&style::styled(&line, &[style::DIM], state.use_color));
+    };
+
+    draw_separator(state, "┌", "┬", "┐", "─");
+
+    for (row_idx, row) in state.table_rows.clone().iter().enumerate() {
+        let mut line = String::new();
+        if state.use_color {
+            line.push_str(&format!("  {}│{} ", style::DIM, style::RESET));
+        } else {
+            line.push_str("  | ");
+        }
+        for (i, cell) in row.iter().enumerate() {
+            let w = col_widths.get(i).copied().unwrap_or(3);
+            let padded = format!("{:<width$}", cell, width = w);
+            let cell_text = if row_idx == 0 {
+                style::styled(&padded, &[style::BOLD], state.use_color)
+            } else {
+                padded
+            };
+            line.push_str(&cell_text);
+            if i < num_cols - 1 {
+                if state.use_color {
+                    line.push_str(&format!(" {}│{} ", style::DIM, style::RESET));
+                } else {
+                    line.push_str(" | ");
+                }
+            }
+        }
+        if state.use_color {
+            line.push_str(&format!(" {}│{}", style::DIM, style::RESET));
+        } else {
+            line.push_str(" |");
+        }
+        state.push_line(&line);
+
+        if row_idx == 0 {
+            draw_separator(state, "├", "┼", "┤", "─");
+        }
+    }
+
+    draw_separator(state, "└", "┴", "┘", "─");
+
+    state.table_rows.clear();
+    state.table_alignments.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser;
+
+    #[test]
+    fn test_heading_renders() {
+        let events = parser::parse("# Hello World");
+        let lines = render(events, 80, false);
+        assert!(lines.iter().any(|l| l.contains("Hello World")));
+    }
+
+    #[test]
+    fn test_bold_renders() {
+        let events = parser::parse("**bold text**");
+        let lines = render(events, 80, true);
+        let joined = lines.join("");
+        assert!(joined.contains("bold text"));
+    }
+
+    #[test]
+    fn test_inline_formatting_stays_on_one_line() {
+        let events = parser::parse("This is **bold** and *italic* text.");
+        let lines = render(events, 80, false);
+        // All text should be on one line (excluding blank lines)
+        let content_lines: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(content_lines.len(), 1, "Expected 1 content line, got: {:?}", content_lines);
+        assert!(content_lines[0].contains("bold"));
+        assert!(content_lines[0].contains("italic"));
+    }
+
+    #[test]
+    fn test_list_renders() {
+        let events = parser::parse("- item one\n- item two");
+        let lines = render(events, 80, false);
+        assert!(lines.iter().any(|l| l.contains("item one")));
+        assert!(lines.iter().any(|l| l.contains("item two")));
+    }
+
+    #[test]
+    fn test_code_block_renders() {
+        let events = parser::parse("```\nlet x = 1;\n```");
+        let lines = render(events, 80, false);
+        assert!(lines.iter().any(|l| l.contains("let x = 1;")));
+    }
+
+    #[test]
+    fn test_horizontal_rule() {
+        let events = parser::parse("---");
+        let lines = render(events, 40, false);
+        assert!(lines.iter().any(|l| l.contains("─")));
+    }
+
+    #[test]
+    fn test_word_wrap() {
+        let events = parser::parse("This is a very long line that should be wrapped when the terminal width is narrow enough to require it.");
+        let lines = render(events, 40, false);
+        let content_lines: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
+        assert!(content_lines.len() > 1, "Long text should wrap");
+        for line in &content_lines {
+            assert!(style::visible_len(line) <= 40, "No line should exceed width");
+        }
+    }
+}
