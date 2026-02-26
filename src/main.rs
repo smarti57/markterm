@@ -26,6 +26,10 @@ struct Cli {
     /// Dump rendered output without paging
     #[arg(long)]
     no_pager: bool,
+
+    /// Truncate long lines with ellipsis instead of wrapping
+    #[arg(long)]
+    no_wrap: bool,
 }
 
 fn main() {
@@ -61,7 +65,7 @@ fn main() {
 
     // Parse and render
     let events = parser::parse(&content);
-    let lines = renderer::render(events, width, use_color);
+    let lines = renderer::render(events, width, use_color, cli.no_wrap);
 
     // Output
     let is_tty = io::stdout().is_terminal();

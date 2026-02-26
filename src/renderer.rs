@@ -6,6 +6,7 @@ use crate::style;
 
 struct RenderState {
     use_color: bool,
+    no_wrap: bool,
     width: usize,
     lines: Vec<String>,
     current_line: String,
@@ -33,9 +34,10 @@ enum ListContext {
 }
 
 impl RenderState {
-    fn new(width: u16, use_color: bool) -> Self {
+    fn new(width: u16, use_color: bool, no_wrap: bool) -> Self {
         Self {
             use_color,
+            no_wrap,
             width: width.saturating_sub(2) as usize, // margin
             lines: Vec::new(),
             current_line: String::new(),
@@ -69,7 +71,7 @@ impl RenderState {
         }
     }
 
-    /// Flush `current_line` with word wrapping applied.
+    /// Flush `current_line` with word wrapping (or truncation in no_wrap mode).
     fn flush_wrapped(&mut self) {
         if self.current_line.is_empty() {
             return;
@@ -84,8 +86,20 @@ impl RenderState {
             return;
         }
 
-        // Split the accumulated styled text into word-sized chunks.
-        // We need to track visible width while preserving ANSI codes.
+        if self.no_wrap {
+            // Truncate mode: single line, add ellipsis if it exceeds width
+            let full = format!("{}{}", prefix, text);
+            let visible = style::visible_len(&full);
+            if visible <= self.width {
+                self.lines.push(full);
+            } else {
+                let truncated = truncate_styled(&full, self.width.saturating_sub(1), self.use_color);
+                self.lines.push(truncated);
+            }
+            return;
+        }
+
+        // Word-wrap mode
         let segments = split_styled_words(&text);
 
         let mut line_buf = prefix.clone();
@@ -95,16 +109,13 @@ impl RenderState {
             let seg_visible = style::visible_len(seg);
 
             if line_visible == 0 {
-                // First word on this line
                 line_buf.push_str(seg);
                 line_visible = seg_visible;
             } else if line_visible + 1 + seg_visible <= available {
-                // Fits with a space
                 line_buf.push(' ');
                 line_buf.push_str(seg);
                 line_visible += 1 + seg_visible;
             } else {
-                // Wrap to next line
                 self.lines.push(line_buf);
                 line_buf = format!("{}{}", prefix, seg);
                 line_visible = seg_visible;
@@ -215,9 +226,41 @@ fn split_styled_words(text: &str) -> Vec<String> {
     words
 }
 
+/// Truncate a string containing ANSI codes to `max_visible` visible characters,
+/// appending an ellipsis character and a RESET if needed.
+fn truncate_styled(text: &str, max_visible: usize, use_color: bool) -> String {
+    let mut result = String::new();
+    let mut visible = 0;
+    let mut in_escape = false;
+
+    for ch in text.chars() {
+        if in_escape {
+            result.push(ch);
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+            result.push(ch);
+        } else {
+            if visible >= max_visible {
+                break;
+            }
+            result.push(ch);
+            visible += 1;
+        }
+    }
+
+    if use_color {
+        result.push_str(style::RESET);
+    }
+    result.push('…');
+    result
+}
+
 /// Render a stream of markdown events into styled terminal lines.
-pub fn render(events: Vec<Event<'_>>, width: u16, use_color: bool) -> Vec<String> {
-    let mut state = RenderState::new(width, use_color);
+pub fn render(events: Vec<Event<'_>>, width: u16, use_color: bool, no_wrap: bool) -> Vec<String> {
+    let mut state = RenderState::new(width, use_color, no_wrap);
 
     for event in events {
         match event {
@@ -554,14 +597,14 @@ mod tests {
     #[test]
     fn test_heading_renders() {
         let events = parser::parse("# Hello World");
-        let lines = render(events, 80, false);
+        let lines = render(events, 80, false, false);
         assert!(lines.iter().any(|l| l.contains("Hello World")));
     }
 
     #[test]
     fn test_bold_renders() {
         let events = parser::parse("**bold text**");
-        let lines = render(events, 80, true);
+        let lines = render(events, 80, true, false);
         let joined = lines.join("");
         assert!(joined.contains("bold text"));
     }
@@ -569,8 +612,7 @@ mod tests {
     #[test]
     fn test_inline_formatting_stays_on_one_line() {
         let events = parser::parse("This is **bold** and *italic* text.");
-        let lines = render(events, 80, false);
-        // All text should be on one line (excluding blank lines)
+        let lines = render(events, 80, false, false);
         let content_lines: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
         assert_eq!(content_lines.len(), 1, "Expected 1 content line, got: {:?}", content_lines);
         assert!(content_lines[0].contains("bold"));
@@ -580,7 +622,7 @@ mod tests {
     #[test]
     fn test_list_renders() {
         let events = parser::parse("- item one\n- item two");
-        let lines = render(events, 80, false);
+        let lines = render(events, 80, false, false);
         assert!(lines.iter().any(|l| l.contains("item one")));
         assert!(lines.iter().any(|l| l.contains("item two")));
     }
@@ -588,25 +630,35 @@ mod tests {
     #[test]
     fn test_code_block_renders() {
         let events = parser::parse("```\nlet x = 1;\n```");
-        let lines = render(events, 80, false);
+        let lines = render(events, 80, false, false);
         assert!(lines.iter().any(|l| l.contains("let x = 1;")));
     }
 
     #[test]
     fn test_horizontal_rule() {
         let events = parser::parse("---");
-        let lines = render(events, 40, false);
+        let lines = render(events, 40, false, false);
         assert!(lines.iter().any(|l| l.contains("─")));
     }
 
     #[test]
     fn test_word_wrap() {
         let events = parser::parse("This is a very long line that should be wrapped when the terminal width is narrow enough to require it.");
-        let lines = render(events, 40, false);
+        let lines = render(events, 40, false, false);
         let content_lines: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
         assert!(content_lines.len() > 1, "Long text should wrap");
         for line in &content_lines {
             assert!(style::visible_len(line) <= 40, "No line should exceed width");
         }
+    }
+
+    #[test]
+    fn test_no_wrap_truncates_with_ellipsis() {
+        let events = parser::parse("This is a very long line that should be truncated when no-wrap mode is enabled.");
+        let lines = render(events, 30, false, true);
+        let content_lines: Vec<&String> = lines.iter().filter(|l| !l.is_empty()).collect();
+        assert_eq!(content_lines.len(), 1, "No-wrap should produce one line");
+        assert!(content_lines[0].ends_with('…'), "Truncated line should end with ellipsis");
+        assert!(style::visible_len(content_lines[0]) <= 30, "Line should not exceed width");
     }
 }
