@@ -7,6 +7,7 @@ A lightweight command-line tool that renders markdown files with VT100/ANSI term
 - **Markdown rendering** — headings, bold, italic, strikethrough, inline code, code blocks, lists, tables, block quotes, links, horizontal rules, task lists
 - **Built-in pager** — page through documents with spacebar, scroll line-by-line, jump to top/bottom
 - **Word wrapping** — respects terminal width with proper line breaking
+- **No-wrap mode** — truncate long lines with ellipsis instead of wrapping
 - **Single binary** — no runtime dependencies, compiles to a standalone executable
 - **Pipe-friendly** — auto-detects TTY; dumps plain output when piped
 
@@ -35,6 +36,7 @@ Options:
   -w, --width <COLS>     Override terminal width
   -t, --theme <THEME>    Color theme: auto, dark, light, none (default: auto)
       --no-pager         Dump rendered output to stdout without paging
+      --no-wrap          Truncate long lines with ellipsis instead of wrapping
   -h, --help             Show help
   -V, --version          Show version
 ```
@@ -53,6 +55,9 @@ markterm --no-pager README.md
 
 # Override terminal width
 markterm -w 60 README.md
+
+# Truncate long lines instead of wrapping
+markterm --no-wrap README.md
 ```
 
 ## Pager Controls
