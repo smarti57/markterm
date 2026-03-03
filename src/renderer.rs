@@ -226,6 +226,55 @@ fn split_styled_words(text: &str) -> Vec<String> {
     words
 }
 
+/// Word-wrap a cell's text to fit within `max_width` visible characters.
+/// Returns a Vec of lines. In no_wrap mode, truncates with ellipsis instead.
+fn wrap_cell_text(text: &str, max_width: usize, no_wrap: bool, use_color: bool) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+
+    let visible = style::visible_len(text);
+    if visible <= max_width {
+        return vec![text.to_string()];
+    }
+
+    if no_wrap {
+        return vec![truncate_styled(text, max_width.saturating_sub(1), use_color)];
+    }
+
+    let words = split_styled_words(text);
+    if words.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = String::new();
+    let mut current_visible = 0usize;
+
+    for word in &words {
+        let word_visible = style::visible_len(word);
+
+        if current_visible == 0 {
+            current_line.push_str(word);
+            current_visible = word_visible;
+        } else if current_visible + 1 + word_visible <= max_width {
+            current_line.push(' ');
+            current_line.push_str(word);
+            current_visible += 1 + word_visible;
+        } else {
+            lines.push(std::mem::take(&mut current_line));
+            current_line = word.to_string();
+            current_visible = word_visible;
+        }
+    }
+
+    if !current_line.is_empty() || lines.is_empty() {
+        lines.push(current_line);
+    }
+
+    lines
+}
+
 /// Truncate a string containing ANSI codes to `max_visible` visible characters,
 /// appending an ellipsis character and a RESET if needed.
 fn truncate_styled(text: &str, max_visible: usize, use_color: bool) -> String {
@@ -520,11 +569,16 @@ fn render_table(state: &mut RenderState) {
     }
 
     let num_cols = state.table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if num_cols == 0 {
+        return;
+    }
+
+    // Calculate natural column widths using visible length (ignoring ANSI codes)
     let mut col_widths = vec![0usize; num_cols];
     for row in &state.table_rows {
         for (i, cell) in row.iter().enumerate() {
             if i < num_cols {
-                col_widths[i] = col_widths[i].max(cell.len());
+                col_widths[i] = col_widths[i].max(style::visible_len(cell));
             }
         }
     }
@@ -532,6 +586,67 @@ fn render_table(state: &mut RenderState) {
     for w in &mut col_widths {
         *w = (*w).max(3);
     }
+
+    // Shrink columns to fit within terminal width
+    // Table overhead: 2 (margin) + 1 (left border) + 1 (right border) + 2*num_cols (spaces) + (num_cols-1) (mid borders)
+    // = 3 + 3*num_cols
+    let overhead = 3 + 3 * num_cols;
+    let max_content = state.width.saturating_sub(overhead);
+    let total: usize = col_widths.iter().sum();
+
+    if total > max_content && max_content > 0 {
+        let min_col_width = 3usize;
+        let guaranteed = min_col_width * num_cols;
+
+        if max_content <= guaranteed {
+            col_widths.fill(min_col_width);
+        } else {
+            // Fair-share: settle columns that fit naturally, redistribute rest
+            let mut remaining = max_content;
+            let mut settled = vec![false; num_cols];
+            let mut settled_count = 0;
+
+            loop {
+                let unsettled = num_cols - settled_count;
+                if unsettled == 0 {
+                    break;
+                }
+                let fair_share = remaining / unsettled;
+                let mut any_settled = false;
+
+                for i in 0..num_cols {
+                    if settled[i] {
+                        continue;
+                    }
+                    if col_widths[i] <= fair_share {
+                        settled[i] = true;
+                        settled_count += 1;
+                        remaining -= col_widths[i];
+                        any_settled = true;
+                    }
+                }
+
+                if !any_settled {
+                    // All remaining columns exceed fair_share — distribute evenly
+                    let share = remaining / unsettled;
+                    let mut extra = remaining % unsettled;
+                    for i in 0..num_cols {
+                        if !settled[i] {
+                            col_widths[i] = share + if extra > 0 { extra -= 1; 1 } else { 0 };
+                        }
+                    }
+                    break;
+                }
+            }
+
+            for w in &mut col_widths {
+                *w = (*w).max(min_col_width);
+            }
+        }
+    }
+
+    let no_wrap = state.no_wrap;
+    let use_color = state.use_color;
 
     let draw_separator = |state: &mut RenderState, left: &str, mid: &str, right: &str, fill: &str| {
         let mut line = format!("  {}", left);
@@ -548,35 +663,64 @@ fn render_table(state: &mut RenderState) {
     draw_separator(state, "┌", "┬", "┐", "─");
 
     for (row_idx, row) in state.table_rows.clone().iter().enumerate() {
-        let mut line = String::new();
-        if state.use_color {
-            line.push_str(&format!("  {}│{} ", style::DIM, style::RESET));
-        } else {
-            line.push_str("  | ");
-        }
-        for (i, cell) in row.iter().enumerate() {
+        // Wrap each cell to its allocated column width
+        let mut wrapped_cells: Vec<Vec<String>> = row.iter().enumerate().map(|(i, cell)| {
             let w = col_widths.get(i).copied().unwrap_or(3);
-            let padded = format!("{:<width$}", cell, width = w);
-            let cell_text = if row_idx == 0 {
-                style::styled(&padded, &[style::BOLD], state.use_color)
+            wrap_cell_text(cell, w, no_wrap, use_color)
+        }).collect();
+
+        // Pad to num_cols if row has fewer cells
+        while wrapped_cells.len() < num_cols {
+            wrapped_cells.push(vec![String::new()]);
+        }
+
+        // Determine tallest cell in this row
+        let max_lines = wrapped_cells.iter().map(|c| c.len()).max().unwrap_or(1);
+
+        // Emit each sub-line of the row
+        for line_idx in 0..max_lines {
+            let mut line = String::new();
+            if use_color {
+                line.push_str(&format!("  {}│{} ", style::DIM, style::RESET));
             } else {
-                padded
-            };
-            line.push_str(&cell_text);
-            if i < num_cols - 1 {
-                if state.use_color {
-                    line.push_str(&format!(" {}│{} ", style::DIM, style::RESET));
+                line.push_str("  | ");
+            }
+
+            for (i, cell_lines) in wrapped_cells.iter().enumerate() {
+                let w = col_widths.get(i).copied().unwrap_or(3);
+                let cell_text = cell_lines.get(line_idx)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+
+                // Pad to column width based on visible length
+                let visible = style::visible_len(cell_text);
+                let pad = w.saturating_sub(visible);
+                let padded = format!("{}{}", cell_text, " ".repeat(pad));
+
+                let styled_cell = if row_idx == 0 {
+                    style::styled(&padded, &[style::BOLD], use_color)
                 } else {
-                    line.push_str(" | ");
+                    padded
+                };
+
+                line.push_str(&styled_cell);
+
+                if i < num_cols - 1 {
+                    if use_color {
+                        line.push_str(&format!(" {}│{} ", style::DIM, style::RESET));
+                    } else {
+                        line.push_str(" | ");
+                    }
                 }
             }
+
+            if use_color {
+                line.push_str(&format!(" {}│{}", style::DIM, style::RESET));
+            } else {
+                line.push_str(" |");
+            }
+            state.push_line(&line);
         }
-        if state.use_color {
-            line.push_str(&format!(" {}│{}", style::DIM, style::RESET));
-        } else {
-            line.push_str(" |");
-        }
-        state.push_line(&line);
 
         if row_idx == 0 {
             draw_separator(state, "├", "┼", "┤", "─");
@@ -660,5 +804,47 @@ mod tests {
         assert_eq!(content_lines.len(), 1, "No-wrap should produce one line");
         assert!(content_lines[0].ends_with('…'), "Truncated line should end with ellipsis");
         assert!(style::visible_len(content_lines[0]) <= 30, "Line should not exceed width");
+    }
+
+    #[test]
+    fn test_table_respects_terminal_width() {
+        let md = "| Short | This column has a very long text that should cause wrapping when the terminal is narrow enough |\n|---|---|\n| a | More long text that definitely exceeds the terminal width for testing purposes |";
+        let events = parser::parse(md);
+        let lines = render(events, 50, false, false);
+        for line in &lines {
+            assert!(
+                style::visible_len(line) <= 50,
+                "Table line exceeds width ({}): '{}'",
+                style::visible_len(line),
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_multiline_cells() {
+        let md = "| A | B |\n|---|---|\n| short | This is a long cell that should definitely wrap to multiple lines within the table row |\n";
+        let events = parser::parse(md);
+        let lines = render(events, 40, false, false);
+        // Count data row lines (lines with | between header separator and bottom border)
+        let table_lines: Vec<&String> = lines.iter().filter(|l| l.contains('|')).collect();
+        // Should have: header + at least 2 lines for the data row (since cell wraps)
+        assert!(table_lines.len() > 3, "Expected multi-line row, got {} table lines: {:?}", table_lines.len(), table_lines);
+    }
+
+    #[test]
+    fn test_wrap_cell_text_basic() {
+        let lines = wrap_cell_text("short text", 20, false, false);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0], "short text");
+    }
+
+    #[test]
+    fn test_wrap_cell_text_wraps() {
+        let lines = wrap_cell_text("this is a longer text that needs wrapping", 15, false, false);
+        assert!(lines.len() > 1, "Should wrap: {:?}", lines);
+        for line in &lines {
+            assert!(style::visible_len(line) <= 15, "Wrapped line too wide: '{}'", line);
+        }
     }
 }
